@@ -1,82 +1,114 @@
 import java.io.IOException;
+import java.lang.System.Logger;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.text.MessageFormat;
 import java.util.*;
-import java.util.logging.Logger;
+import java.util.concurrent.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import static java.lang.System.Logger.Level.*;
+
 public class Crawler {
+
+  /**
+   * Custom logger class
+   */
+  public static class ConsoleLogger implements System.Logger {
+    @Override
+    public String getName() {
+      return "ConsoleLogger";
+    }
+
+    @Override
+    public boolean isLoggable(Level level) {
+      return true;
+    }
+
+    @Override
+    public void log(Level level, ResourceBundle bundle, String msg, Throwable thrown) {
+      System.out.printf("[%s %s]: %s - %s%n", level, Thread.currentThread().getName(), msg, thrown);
+    }
+
+    @Override
+    public void log(Level level, ResourceBundle bundle, String format, Object... params) {
+      System.out.printf("[%s %s]: %s%n", level, Thread.currentThread().getName(),
+        MessageFormat.format(format, params));
+    }
+  }
+
   private static HttpClient CLIENT;
   private static Logger LOGGER;
 
   public static void main (String[] args) {
-    LOGGER =  Logger.getLogger(Crawler.class.getName());
-    CLIENT = HttpClient.newHttpClient();
+    LOGGER = new ConsoleLogger();
+    CLIENT = HttpClient.newBuilder()
+      .followRedirects(HttpClient.Redirect.NORMAL)
+      .build();
 
-    final String START_CRAWL_URL = "https://www.educative.io/courses/grokking-the-system-design-interview/NE5LpPrWrKv";
-    final String DOMAIN = "educative.io";
+    BlockingQueue<String> queue = new LinkedBlockingQueue<>();
+    Set<String> visited = Collections.synchronizedSet(new HashSet<>());
 
-    Deque<String> queue = new ArrayDeque<>();
+    final String START_CRAWL_URL = "https://www.oracle.com";
+    final String RESTRICT_TO_DOMAIN = "oracle.com";
     queue.add(START_CRAWL_URL);
 
-    Set<String> visited = new HashSet<>();
+    // Create a thread pool with MAX_THREADS equal to number of cores in CPU
+    final int MAX_THREADS = Runtime.getRuntime().availableProcessors();
+    LOGGER.log(INFO, "Creating thread pool with " + MAX_THREADS + " threads.");
+    ExecutorService es = Executors.newFixedThreadPool(MAX_THREADS);
 
-    while (!queue.isEmpty()) {
-      // Remove the next URL to process
-      String currUrl = queue.remove();
-      LOGGER.info("Processing: " + currUrl);
+    // Create MAX_THREADS amount of work for the thread pool
+    for (int i = 0; i < MAX_THREADS; i++) {
+      es.execute( () -> {
 
-      // Get the HTML for the URL
-      String html = getHTML(currUrl, 3);
+        // Execute indefinitely until queue is empty
+        while (true) {
+          String currUrl = null;
+          try {
+            // Remove the next URL to process, or return null if nothing to process after waiting
+            currUrl = queue.poll(3, TimeUnit.SECONDS);
 
-      // If unable to get HTML, ignore this page
-      if (html == null) {
-        continue;
-      }
+            // Exit thread if nothing to process.
+            if (currUrl == null) {
+              LOGGER.log(WARNING, "Exiting due to nothing to process.");
+              break;
+            }
+          } catch (InterruptedException e) {
+            e.printStackTrace();
+            // Exit thread if error.
+            LOGGER.log(ERROR, "Exiting thread due to an error.");
+            break;
+          }
 
-      visited.add(currUrl);
+          if (!visited.contains(currUrl)) {
+            visited.add(currUrl);
 
-      // Get the list of URLs this page contains
-      List<String> urls = getUrls(html, DOMAIN);
+            // Get the HTML for the URL
+            LOGGER.log(INFO, "Processing: " + currUrl);
+            String html = getHTML(currUrl, 3);
 
-      // Add to the queue if not already visited
-      for (String url : urls) {
-        if (!visited.contains(url))
-          queue.add(url);
-      }
+            // If unable to get HTML, ignore this page
+            if (html == null) {
+              continue;
+            }
+
+            // Get the list of URLs this page contains
+            List<String> urls = getUrls(html, RESTRICT_TO_DOMAIN);
+
+            // Add to the queue if not already visited
+            queue.addAll(urls);
+          }
+        }
+      });
     }
 
-    LOGGER.info("Done.");
-  }
-
-  /**
-   *
-   * @param html The HTML of the page to process
-   * @param domain Filters the URLs in the page to only match this domain
-   * @return A list of urls, as Strings.
-   */
-  private static List<String> getUrls(String html, String domain) {
-    List<String> urls = new ArrayList<>();
-
-    Pattern p = Pattern.compile("(http|https)://([\\w_-]+(?:(?:\\.[\\w_-]+)+))([\\w.,@?^=%&:/~+#-]*[\\w@?^=%&/~+#-])?");
-    Matcher m = p.matcher(html);
-
-    while (m.find()) {
-      // Only crawl in links to the same domain
-      if (m.group(2).contains(domain))
-
-        // Do not crawl in images
-        if (m.group(3) == null || !(m.group(3).endsWith(".ico")
-                                    || m.group(3).endsWith(".png")
-                                    || m.group(3).endsWith(".jpg")
-                                    || m.group(3).endsWith(".jpeg")))
-          urls.add(m.group());
-    }
-
-    return urls;
+    // Shut down executor service once all threads are finished
+    es.shutdown();
+    LOGGER.log(INFO, "Done.");
   }
 
   /**
@@ -101,20 +133,49 @@ public class Crawler {
         }
 
         attempts += 1;
-        if (attempts < retries)
-          LOGGER.warning("HTTP status code: " + response.statusCode() + ". Attempts: " + attempts + ". Retrying...");
-        else
-          LOGGER.severe("Attempts: " + attempts + ". Limit hit, not retrying.");
+        LOGGER.log(WARNING, "HTTP status code: " + response.statusCode()
+          + ". Attempts: " + attempts
+          + (attempts < retries ? ". Retrying..." : ". Limit hit, not retrying."));
+
       } catch (IOException | InterruptedException e) {
         e.printStackTrace();
         attempts += 1;
-        if (attempts < retries)
-          LOGGER.warning("Attempts: " + attempts + ". Retrying...");
-        else
-          LOGGER.severe("Attempts: " + attempts + ". Limit hit, not retrying.");
+        LOGGER.log(WARNING, "Attempts: " + attempts
+          + (attempts < retries ? ". Retrying..." : ". Limit hit, not retrying."));
       }
     }
 
     return response == null ? null : response.body();
+  }
+
+  /**
+   *
+   * @param html The HTML of the page to process
+   * @param domain Filters the URLs in the page to only match this domain
+   * @return A list of urls, as Strings.
+   */
+  private static List<String> getUrls(String html, String domain) {
+    List<String> urls = new ArrayList<>();
+
+    Pattern p = Pattern.compile("(http|https)://([\\w_-]+(?:(?:\\.[\\w_-]+)+))([\\w.,@?^=%&:/~+#-]*[\\w@?^=%&/~+#-])?");
+    Matcher m = p.matcher(html);
+
+    while (m.find()) {
+      // Only crawl in links to the same domain
+      if (m.group(2).contains(domain))
+
+        // Do not crawl in images or resources
+        if (m.group(3) == null || !(m.group(3).endsWith(".ico")
+          || m.group(3).endsWith(".png")
+          || m.group(3).endsWith(".jpg")
+          || m.group(3).endsWith(".jpeg")
+          || m.group(3).endsWith(".css")
+          || m.group(3).endsWith(".js"))) {
+          String url = m.group();
+          urls.add(url.endsWith("/") ? url.substring(0, url.length()-1) : url);
+        }
+    }
+
+    return urls;
   }
 }
